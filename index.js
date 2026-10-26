@@ -16,8 +16,14 @@ JoyConsole.init();
 const {
   makeWASocket,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  DisconnectReason
 } = require("baileys");
+
+const {
+  acquireInstanceLock,
+  releaseInstanceLock
+} = require("./utils/singleInstance");
 
 const fs = require("fs");
 const path = require("path");
@@ -66,6 +72,32 @@ const AUTHOR = "Hilal";
 const AUTHOR_NUMBER = "222079890813069";
 
 const PROJECT_ROOT = __dirname;
+
+/* =========================================================
+   WHATSAPP CONNECTION STATE
+   ---------------------------------------------------------
+   Hanya boleh ada SATU socket aktif dan SATU proses yang
+   memakai folder auth. Ini mencegah state Signal saling
+   menimpa saat reconnect / restart.
+========================================================= */
+
+const AUTH_DIR = path.join(PROJECT_ROOT, "sessions");
+const INSTANCE_LOCK = path.join(AUTH_DIR, ".joybot.lock");
+
+const RECONNECT_BASE_MS = 2000;
+const RECONNECT_MAX_MS = 60000;
+const SENT_MESSAGE_CACHE_LIMIT = 256;
+
+let activeSocket = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let connecting = false;
+let shuttingDown = false;
+let instanceLockPath = null;
+
+// Dipakai untuk menjawab retry request WhatsApp (getMessage).
+// Hanya isi pesan terakhir yang disimpan, bukan kredensial.
+const sentMessageCache = new Map();
 
 const SPINNER = [
   "◐",
@@ -755,12 +787,33 @@ async function loadingStep(
 ========================================================= */
 
 async function showBanner() {
+    // Ambil lock SEBELUM menyentuh folder auth. Jika terminal lama
+    // masih hidup, proses baru menunggu (khusus restart) atau berhenti.
+    const lockTimeout = Number(process.env.JOYBOT_RESTART_WAIT) || 10000;
+
+    try {
+        instanceLockPath = await acquireInstanceLock({
+            lockPath: INSTANCE_LOCK,
+            timeoutMs: lockTimeout
+        });
+    } catch (error) {
+        console.error(chalk.red(`\n${error.message}`));
+        process.exit(1);
+    }
+
+    registerShutdownHandlers();
+
+    JoyConsole.setShutdownHandler?.(() => gracefulShutdown("SIGINT"));
     JoyConsole.setStartupBanner(renderLogoWithText);
     await JoyConsole.startup();
     await connectToWhatsApp();
 }
 
-showBanner();
+showBanner().catch((error) => {
+    console.error("Startup failed:", error);
+    JoyConsole.recordError?.(error, "startup");
+    scheduleReconnect("startup failure");
+});
 
 
 /* =========================================================
@@ -799,34 +852,208 @@ async function question(prompt) {
 
 
 /* =========================================================
+   WHATSAPP CONNECTION HELPERS
+========================================================= */
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+
+function rememberSentMessage(trackingKey, message) {
+  if (!trackingKey || !message) {
+    return;
+  }
+
+  sentMessageCache.set(trackingKey, message);
+
+  while (sentMessageCache.size > SENT_MESSAGE_CACHE_LIMIT) {
+    const oldestKey = sentMessageCache.keys().next().value;
+
+    if (oldestKey === undefined) {
+      break;
+    }
+
+    sentMessageCache.delete(oldestKey);
+  }
+}
+
+
+async function closeActiveSocket() {
+  const socket = activeSocket;
+  activeSocket = null;
+
+  if (!socket) {
+    return;
+  }
+
+  try {
+    await new Promise((resolve) => {
+      let settled = false;
+
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+
+      const timer = setTimeout(finish, 5000);
+
+      if (typeof timer.unref === "function") {
+        timer.unref();
+      }
+
+      Promise.resolve()
+        .then(() => socket.end(undefined))
+        .then(finish, (error) => {
+          console.error(
+            "Gagal menutup socket WhatsApp:",
+            error.message
+          );
+
+          finish();
+        });
+    });
+  } catch (error) {
+    console.error(
+      "Gagal menutup socket WhatsApp:",
+      error.message
+    );
+  }
+}
+
+
+function scheduleReconnect(reason) {
+  if (shuttingDown || reconnectTimer) {
+    return;
+  }
+
+  const attempt = Math.min(reconnectAttempts, 5);
+
+  const delay = Math.min(
+    RECONNECT_MAX_MS,
+    RECONNECT_BASE_MS * (2 ** attempt)
+  ) + Math.floor(Math.random() * 500);
+
+  reconnectAttempts += 1;
+
+  console.log(
+    chalk.yellow(
+      `Reconnect attempt ${reconnectAttempts} in ${delay} ms (${reason})`
+    )
+  );
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+
+    connectToWhatsApp().catch((error) => {
+      console.error("Reconnect failed:", error);
+      JoyConsole.recordError?.(error, "reconnect");
+      scheduleReconnect("reconnect failed");
+    });
+  }, delay);
+}
+
+
+async function gracefulShutdown(signal = "shutdown") {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+  clearReconnectTimer();
+
+  console.log(
+    chalk.yellow(`\nMenutup Joybot (${signal})...`)
+  );
+
+  await closeActiveSocket();
+
+  try {
+    JoyConsole.shutdown?.();
+  } catch (error) {
+    console.error(
+      "Console shutdown error:",
+      error.message
+    );
+  }
+
+  releaseInstanceLock(instanceLockPath || undefined);
+  instanceLockPath = null;
+
+  process.exit(0);
+}
+
+
+function registerShutdownHandlers() {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
+    try {
+      process.once(signal, () => {
+        gracefulShutdown(signal);
+      });
+    } catch {}
+  }
+
+  // process.exit() tetap melepas lock (mis. dari command restart).
+  process.once("exit", () => {
+    releaseInstanceLock(instanceLockPath || undefined);
+  });
+}
+
+
+/* =========================================================
    WHATSAPP CONNECTION
 ========================================================= */
 
 async function connectToWhatsApp() {
+  if (shuttingDown || connecting) {
+    return;
+  }
 
-  const {
-    state,
-    saveCreds
-  } =
-    await useMultiFileAuthState(
-      "./sessions"
-    );
+  connecting = true;
 
+  try {
+    // Jangan pernah membuat socket baru di atas socket lama.
+    // Jika reconnect dipanggil saat socket sebelumnya masih ada,
+    // tutup dulu agar hanya satu socket yang menulis ke auth.
+    if (activeSocket) {
+      await closeActiveSocket();
+    }
 
-  const {
-    version,
-    isLatest
-  } =
-    await fetchLatestBaileysVersion();
-
-
-  console.log(
-    `Using WhatsApp V${version.join(".")}, isLatest: ${isLatest}`
-  );
+    const {
+      state,
+      saveCreds
+    } = await useMultiFileAuthState(AUTH_DIR);
 
 
-  const Joy =
-    makeWASocket({
+    let version;
+    let isLatest = false;
+
+    try {
+      const latest = await fetchLatestBaileysVersion();
+
+      version = latest.version;
+      isLatest = latest.isLatest;
+
+      console.log(
+        `Using WhatsApp V${version.join(".")}, isLatest: ${isLatest}`
+      );
+    } catch (error) {
+      console.warn(
+        "Gagal mengambil versi WhatsApp terbaru, memakai versi default Baileys:",
+        error.message
+      );
+    }
+
+
+    const socketConfig = {
 
       logger:
         pino({
@@ -845,85 +1072,87 @@ async function connectToWhatsApp() {
         "20.0.04"
       ],
 
-      version,
-
       syncFullHistory:
         true,
 
       generateHighQualityLinkPreview:
-        true
+        true,
 
-    });
+      getMessage: async (key) => {
+        if (!key?.id) {
+          return undefined;
+        }
+
+        const cacheKey = `${key.remoteJid || ""}:${key.id}`;
+        return sentMessageCache.get(cacheKey)?.message;
+      }
+
+    };
+
+    if (version) {
+      socketConfig.version = version;
+    }
 
 
-Joy.sentMessages = new Set();
-Joy.sentMessageKeys = new Map();
+    const Joy = makeWASocket(socketConfig);
 
-const originalSendMessage =
-    Joy.sendMessage.bind(Joy);
+    activeSocket = Joy;
 
-Joy.sendMessage = async (...args) => {
-    const result = await originalSendMessage(...args);
+    Joy.sentMessages = new Set();
+    Joy.sentMessageKeys = new Map();
 
-    const content = args[1];
 
-    const isDeleteMessage =
+    // WAJIB dipasang sebelum requestPairingCode agar creds
+    // hasil pairing tidak hilang ketika proses selesai.
+    Joy.ev.on("creds.update", saveCreds);
+
+
+    const originalSendMessage =
+      Joy.sendMessage.bind(Joy);
+
+    Joy.sendMessage = async (...args) => {
+      const result = await originalSendMessage(...args);
+
+      const content = args[1];
+
+      const isDeleteMessage =
         content &&
         typeof content === "object" &&
         Boolean(content.delete);
 
-    if (result?.key?.id && !isDeleteMessage) {
+
+      const sentText = content?.text;
+
+      if (
+        typeof sentText === "string" &&
+        sentText.trim()
+      ) {
+        console.log(
+          chalk.green.bold("[BOT]"),
+          chalk.green.bold(BOT_NAME),
+          chalk.gray(" : "),
+          chalk.white(sentText)
+        );
+      }
+
+
+      if (result?.key?.id && !isDeleteMessage) {
         const chatId =
-            result.key.remoteJid || args[0];
+          result.key.remoteJid || args[0];
 
         const trackingKey =
-            `${chatId}:${result.key.id}`;
+          `${chatId}:${result.key.id}`;
 
         Joy.sentMessages.add(trackingKey);
         Joy.sentMessageKeys.set(
-            trackingKey,
-            result.key
-        );
-    }
-
-    return result;
-};
-
-
-  Joy.sendMessage =
-    async (...args) => {
-
-      const result =
-        await originalSendMessage(
-          ...args
+          trackingKey,
+          result.key
         );
 
-        const sentText = args[1]?.text;
-
-        if (
-            typeof sentText === "string" &&
-            sentText.trim()
-        ) {
-            console.log(
-                chalk.green.bold("[BOT]"),
-                chalk.green.bold(BOT_NAME),
-                chalk.gray(" : "),
-                chalk.white(sentText)
-            );
-        }
-
-
-      if (
-        result?.key?.id
-      ) {
-
-        const chatId =
-          args[0];
-
-        Joy.sentMessages.add(
-          `${chatId}:${result.key.id}`
+        rememberSentMessage(
+          trackingKey,
+          result.message || content
         );
-
       }
 
 
@@ -931,131 +1160,131 @@ Joy.sendMessage = async (...args) => {
     };
 
 
-  /* =======================================================
-     JOY CONSOLE ATTACH
-     Memberi tahu Joy Console socket yang sedang aktif.
-     TIDAK membuat koneksi WhatsApp baru.
-  ======================================================= */
-
-  JoyConsole.attachSocket(Joy);
+    // Dipakai command restart agar socket ditutup rapi
+    // sebelum proses lama keluar.
+    Joy.stop = async () => {
+      await closeActiveSocket();
+    };
 
 
-  /* =======================================================
-     PAIRING CODE
-  ======================================================= */
+    /* =======================================================
+       JOY CONSOLE ATTACH
+       Memberi tahu Joy Console socket yang sedang aktif.
+       TIDAK membuat koneksi WhatsApp baru.
+    ======================================================= */
 
-  if (
-    usePairingCode &&
-    !Joy.authState.creds.registered
-  ) {
+    JoyConsole.attachSocket(Joy);
 
-    try {
+    /* =======================================================
+       CONNECTION
+    ======================================================= */
 
-      const phoneNumber =
-        await question(
-          "Enter Phone Number (62) :\n"
-        );
+    Joy.ev.on(
+      "connection.update",
+      (update) => {
 
+        const {
+          connection
+        } = update;
 
-      const code =
-        await Joy.requestPairingCode(
-          phoneNumber.trim()
-        );
+        // Abaikan SEMUA event dari socket lama. Tanpa guard ini,
+        // reconnect bisa membuat beberapa socket aktif yang
+        // menulis ke folder auth yang sama, dan status console
+        // bisa tertimpa oleh socket yang sudah ditutup.
+        if (Joy !== activeSocket) {
+          return;
+        }
 
-
-      console.log(
-        `Pairing Code : ${code}`
-      );
-
-
-    } catch (error) {
-
-      console.error(
-        "Failed to get pairing code:",
-        error
-      );
-
-    }
-  }
+        // Joy Console: perbarui status koneksi WhatsApp.
+        JoyConsole.setConnection(connection, update);
 
 
-  /* =======================================================
-     CREDENTIALS
-  ======================================================= */
+        if (
+          connection === "close"
+        ) {
 
-  Joy.ev.on(
-    "creds.update",
-    saveCreds
-  );
+          activeSocket = null;
 
+          if (shuttingDown) {
+            return;
+          }
 
-  /* =======================================================
-     CONNECTION
-  ======================================================= */
+          const statusCode =
+            update.lastDisconnect
+              ?.error
+              ?.output
+              ?.statusCode;
 
-  Joy.ev.on(
-    "connection.update",
-    (update) => {
+          const reason =
+            update.lastDisconnect
+              ?.error
+              ?.message ||
+            String(statusCode || "unknown");
 
-      const {
-        connection
-      } = update;
-
-      // Joy Console: perbarui status koneksi WhatsApp.
-      JoyConsole.setConnection(connection, update);
-
-
-      if (
-        connection === "close"
-      ) {
-
-        console.log(
-          chalk.red(
-            "\n❌ Connection Lost, Trying to Reconnect"
-          )
-        );
+          console.log(
+            chalk.red(
+              `\n❌ Connection Lost (${reason}), scheduling reconnect`
+            )
+          );
 
 
-        connectToWhatsApp();
+          if (
+            statusCode ===
+            DisconnectReason.loggedOut
+          ) {
+            console.error(
+              chalk.red(
+                "WhatsApp logged out. Joybot tidak reconnect otomatis dan TIDAK menghapus session. Pairing ulang harus dilakukan manual."
+              )
+            );
+
+            return;
+          }
+
+
+          scheduleReconnect(reason);
+
+        }
+
+
+        if (
+          connection === "open"
+        ) {
+
+          clearReconnectTimer();
+          reconnectAttempts = 0;
+
+          console.log(
+            chalk.cyan(
+              "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+          );
+
+
+          console.log(
+            chalk.green.bold(
+              "O N L I N E"
+            )
+          );
+
+
+          console.log(
+            chalk.gray(
+              "Waiting for messages..."
+            )
+          );
+
+
+          console.log(
+            chalk.cyan(
+              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+          );
+
+        }
 
       }
-
-
-      if (
-        connection === "open"
-      ) {
-
-        console.log(
-          chalk.cyan(
-            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          )
-        );
-
-
-        console.log(
-          chalk.green.bold(
-            "O N L I N E"
-          )
-        );
-
-
-        console.log(
-          chalk.gray(
-            "Waiting for messages..."
-          )
-        );
-
-
-        console.log(
-          chalk.cyan(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-          )
-        );
-
-      }
-
-    }
-  );
+    );
 
 
   /* =======================================================
@@ -1140,9 +1369,76 @@ Joy.sendMessage = async (...args) => {
   );
 
 
-  // Joy Console: mulai dashboard + prompt setelah semua
-  // listener terpasang dan pairing (jika ada) selesai.
-  JoyConsole.ready();
+    // Socket sudah terpasang. Reconnect tetap boleh berjalan
+    // walaupun pairing code sedang menunggu input.
+    connecting = false;
+
+
+    /* =======================================================
+       PAIRING CODE
+    ======================================================= */
+
+    if (
+      usePairingCode &&
+      !state.creds.registered
+    ) {
+
+      try {
+
+        const phoneNumber =
+          await question(
+            "Enter Phone Number (62) :\n"
+          );
+
+
+        const code =
+          await Joy.requestPairingCode(
+            phoneNumber.trim()
+          );
+
+
+        console.log(
+          `Pairing Code : ${code}`
+        );
+
+
+      } catch (error) {
+
+        console.error(
+          "Failed to get pairing code:",
+          error
+        );
+
+      }
+    }
+
+
+    // Joy Console: mulai dashboard + prompt setelah semua
+    // listener terpasang dan pairing (jika ada) selesai.
+    try {
+      JoyConsole.ready();
+    } catch (error) {
+      console.error(
+        "Gagal memulai Joy Console:",
+        error.message
+      );
+    }
+
+  } catch (error) {
+    connecting = false;
+
+    // Jangan tinggalkan socket setengah jadi yang masih bisa
+    // menulis ke folder auth saat reconnect berikutnya.
+    await closeActiveSocket();
+
+    console.error(
+      "Gagal membuat koneksi WhatsApp:",
+      error
+    );
+
+    JoyConsole.recordError?.(error, "connectToWhatsApp");
+    scheduleReconnect("gagal membuat socket");
+  }
 }
 
 

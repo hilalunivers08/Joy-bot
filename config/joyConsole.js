@@ -12,7 +12,7 @@ module.exports = {
 
     // Aktifkan / matikan seluruh Joy Console.
     // Jika false, Joybot berjalan seperti biasa tanpa dashboard.
-    enabled: true,
+    enabled: false,
 
     // Warna aksen utama Joy Console (nama warna chalk).
     // Contoh lain: "cyan", "magenta", "blue", "yellow".

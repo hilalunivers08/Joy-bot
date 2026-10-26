@@ -47,6 +47,7 @@ let interactive = false;
 let started = false;
 let bannerRenderer = null;
 let tearingDown = false;
+let shutdownHandler = null;
 
 let rl = null;
 let refreshTimer = null;
@@ -603,6 +604,23 @@ function ready() {
 
     rl.on("SIGINT", () => {
         process.stdout.write("\n");
+
+        // Utamakan graceful shutdown milik index.js (menutup
+        // socket + melepas lock) agar session tidak tertinggal
+        // dalam keadaan setengah tertulis.
+        if (shutdownHandler) {
+            Promise.resolve(shutdownHandler("SIGINT")).catch((error) => {
+                logger.log(
+                    "error",
+                    `Shutdown error: ${error.message}`
+                );
+                shutdown();
+                process.exit(1);
+            });
+
+            return;
+        }
+
         shutdown();
         process.exit(0);
     });
@@ -633,6 +651,11 @@ function ready() {
             logger.log("error", `Dashboard render error: ${error.message}`);
         }
     }, Math.max(250, CONFIG.refreshInterval || 1000));
+}
+
+// Didaftarkan oleh index.js agar Ctrl+C menutup socket dulu.
+function setShutdownHandler(fn) {
+    shutdownHandler = typeof fn === "function" ? fn : null;
 }
 
 // Hentikan seluruh console (dipakai SIGINT).
@@ -867,6 +890,7 @@ module.exports = {
     setConnection,
     recordMessage,
     recordError,
+    setShutdownHandler,
     shutdown,
     // Untuk pengujian / pemakaian lanjutan:
     _internal: {

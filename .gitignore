@@ -48,3 +48,6 @@ utils/tokenStats.json
 
 # File sementara
 folder-tree.txt
+
+# Cadangan auth lokal (berisi creds, jangan pernah di-commit)
+backups/

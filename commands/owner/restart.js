@@ -18,7 +18,12 @@ module.exports = async (
         entryArgs,
         {
             cwd: process.cwd(),
-            env: process.env,
+            env: {
+                ...process.env,
+                // Beri waktu proses lama menutup socket + melepas
+                // lock auth sebelum proses baru mulai.
+                JOYBOT_RESTART_WAIT: "60000"
+            },
             detached: true,
             stdio: "inherit",
             windowsHide: false
@@ -41,6 +46,17 @@ module.exports = async (
         } catch (error) {
             console.error(
                 "Gagal mengirim pesan restart:",
+                error.message
+            );
+        }
+
+        // Tutup socket dengan rapi sebelum keluar. Proses baru
+        // sudah menunggu lock, jadi tidak ada dua socket aktif.
+        try {
+            await Joy.stop?.();
+        } catch (error) {
+            console.error(
+                "Gagal menutup socket saat restart:",
                 error.message
             );
         }
