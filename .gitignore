@@ -51,3 +51,5 @@ folder-tree.txt
 
 # Cadangan auth lokal (berisi creds, jangan pernah di-commit)
 backups/
+# spotify profiel
+.spotify-profile/

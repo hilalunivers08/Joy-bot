@@ -25,6 +25,7 @@ const tomed = require("../commands/media/tomed");
 const shop = require("../commands/economy/shop");
 const inventory = require("../commands/economy/inventory");
 const leaderboard = require("../database/leaderboard");
+const spotify = require("../commands/system/spotify");
 
 
 
@@ -642,10 +643,17 @@ async function messageHandler(Joy, m) {
                 command,
                 { isAuthor }
             );
-            break;
 
-        default:
-            break;
+        // spotify plauer
+
+        case "play":
+        case "pause":
+        case "next":
+        case "prev":
+        case "previous":
+        case "spotatus":
+        await spotify.execute(Joy, msg, args, command);
+        break;
 
     }
     } finally {
