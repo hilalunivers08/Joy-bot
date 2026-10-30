@@ -644,7 +644,7 @@ async function messageHandler(Joy, m) {
                 { isAuthor }
             );
 
-        // spotify plauer
+        // spotify controller
 
         case "play":
         case "pause":
@@ -654,8 +654,8 @@ async function messageHandler(Joy, m) {
         case "pre":
         case "previous":
         case "spotatus":
-        await spotify.execute(Joy, msg, args, command);
-        break;
+            await spotify.execute(Joy, msg, args, command);
+            break;
     }
     } finally {
         processingCommands.delete(commandKey);

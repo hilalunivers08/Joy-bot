@@ -51,5 +51,9 @@ folder-tree.txt
 
 # Cadangan auth lokal (berisi creds, jangan pernah di-commit)
 backups/
-# spotify profiel
+# spotify profiles (automation)
 .spotify-profile/
+Brave-Browser-Spotify-Automation/
+.brave-spotify-automation/
+.spotify-cdp-profile/
+spotify-profile/
