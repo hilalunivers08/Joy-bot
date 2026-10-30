@@ -649,12 +649,13 @@ async function messageHandler(Joy, m) {
         case "play":
         case "pause":
         case "next":
+        case "n":
         case "prev":
+        case "pre":
         case "previous":
         case "spotatus":
         await spotify.execute(Joy, msg, args, command);
         break;
-
     }
     } finally {
         processingCommands.delete(commandKey);

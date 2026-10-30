@@ -265,21 +265,60 @@ async function getSpotifyStatus(page) {
 // ==========================================
 
 async function clickPagePlayButton(page) {
-  const button = await findFirst(page, [
+  const selectors = [
     'main button[data-testid="play-button"]',
+    'main button[aria-label*="Play"]',
+    'main button[title*="Play"]',
     'button[data-testid="play-button"]',
-    'main button[aria-label^="Play"]',
-    'main button[title^="Play"]',
-  ]);
+    'button[aria-label*="Play"]',
+  ];
 
-  if (!button) {
-    return false;
+  for (const selector of selectors) {
+    const buttons = page.locator(selector);
+    const count = await buttons.count();
+
+    for (let i = 0; i < count; i++) {
+      const button = buttons.nth(i);
+
+      if (!(await button.isVisible().catch(() => false))) {
+        continue;
+      }
+
+      if (!(await button.isEnabled().catch(() => false))) {
+        continue;
+      }
+
+      const label = await getButtonLabel(button);
+
+      // Jangan menekan tombol yang sudah berstatus Pause.
+      if (/pause/i.test(label)) {
+        continue;
+      }
+
+      try {
+        await button.scrollIntoViewIfNeeded();
+        await button.click({ timeout: 8000 });
+
+        await page.waitForTimeout(2000);
+
+        const playPause = page
+          .locator(PLAY_PAUSE)
+          .first();
+
+        const currentLabel = await getButtonLabel(playPause);
+
+        if (/pause/i.test(currentLabel)) {
+          return true;
+        }
+      } catch (error) {
+        console.log(
+          `[SPOTIFY] Gagal klik selector ${selector}: ${error.message}`
+        );
+      }
+    }
   }
 
-  await button.click();
-  await page.waitForTimeout(1500);
-
-  return true;
+  return false;
 }
 
 async function playSpotify(page, input) {
@@ -374,83 +413,87 @@ async function playSpotify(page, input) {
   // PLAY SONG
   // ----------------------------------------
 
-  const trackRow = page
-    .locator('[data-testid="tracklist-row"]')
-    .first();
+  // Jangan hanya bergantung pada data-testid="tracklist-row".
+  // Spotify dapat mengubah struktur baris hasil pencarian, tetapi
+  // tautan ke halaman track biasanya tetap tersedia.
+  const trackSelectors = [
+    'main a[href*="/track/"]',
+    '[data-testid="main-view-container"] a[href*="/track/"]',
+    'a[href*="/track/"]',
+  ];
 
-  try {
-    await trackRow.waitFor({ state: "visible" });
-  } catch {
+  let trackUrl = null;
+  let trackTitle = searchQuery;
+
+  for (const selector of trackSelectors) {
+    const trackLinks = page.locator(selector);
+    const count = await trackLinks.count();
+
+    for (let i = 0; i < count; i++) {
+      const trackLink = trackLinks.nth(i);
+
+      if (!(await trackLink.isVisible().catch(() => false))) {
+        continue;
+      }
+
+      const href = await trackLink.getAttribute("href");
+      if (!href) continue;
+
+      try {
+        const candidate = new URL(
+          href,
+          "https://open.spotify.com"
+        );
+
+        if (!/^\/track\/[A-Za-z0-9]+/.test(candidate.pathname)) {
+          continue;
+        }
+
+        trackUrl = candidate.toString();
+        trackTitle =
+          (await trackLink.innerText().catch(() => "")).trim() ||
+          searchQuery;
+        break;
+      } catch {
+        continue;
+      }
+    }
+
+    if (trackUrl) break;
+  }
+
+  if (!trackUrl) {
     return {
       success: false,
-      message: `❌ Lagu "${searchQuery}" tidak ditemukan.`,
+      message:
+        `❌ Hasil pencarian muncul, tetapi link lagu "${searchQuery}" tidak berhasil dibaca. ` +
+        "Kemungkinan struktur hasil pencarian Spotify berubah atau hasil belum selesai dimuat.",
     };
   }
 
-  await trackRow.hover().catch(() => {});
+  // Buka halaman track secara langsung, lalu gunakan tombol Play
+  // di halaman tersebut. Ini tidak bergantung pada tracklist-row.
+  await page.goto(trackUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  });
 
-  const trackLink = trackRow
-    .locator('a[href*="/track/"]')
-    .first();
+  await page.waitForTimeout(3000);
 
-  let trackTitle = searchQuery;
-  let trackUrl = null;
+  const clicked = await clickPagePlayButton(page);
 
-  if (await trackLink.count()) {
-    trackTitle =
-      (await trackLink.innerText()).trim() || searchQuery;
-
-    const href = await trackLink.getAttribute("href");
-
-    if (href) {
-      trackUrl = new URL(
-        href,
-        "https://open.spotify.com"
-      ).toString();
-    }
-  }
-
-  // Utamakan tombol Play pada baris hasil pencarian.
-  const rowPlayButton = trackRow
-    .locator(
-      'button[data-testid="play-button"], button[aria-label^="Play"]'
-    )
-    .first();
-
-  if (await rowPlayButton.count()) {
-    await rowPlayButton.click();
-    await page.waitForTimeout(1800);
-
+  if (clicked) {
     return {
       success: true,
       message: `▶️ Memutar: ${trackTitle}`,
     };
   }
 
-  // Alternatif: buka halaman lagu lalu klik tombol Play.
-  if (trackUrl) {
-    await page.goto(trackUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000,
-    });
-
-    await page.waitForTimeout(2500);
-
-    const clicked = await clickPagePlayButton(page);
-
-    if (clicked) {
-      return {
-        success: true,
-        message: `▶️ Memutar: ${trackTitle}`,
-      };
-    }
-  }
-
   return {
     success: false,
     message:
-      "⚠️ Lagu ditemukan, tetapi tombol Play tidak terdeteksi. " +
-      "Kemungkinan tampilan Spotify Web berubah.",
+      `⚠️ Lagu "${trackTitle}" ditemukan, tetapi tombol Play tidak terdeteksi. ` +
+      "Kemungkinan tampilan Spotify Web berubah atau akun tidak dapat memutar lagu tersebut.",
   };
 }
 
@@ -459,9 +502,14 @@ async function playSpotify(page, input) {
 // ==========================================
 
 async function executeCommand(sock, msg, args, command) {
-  const action = (command || args[0] || "")
+  const rawAction = (command || args[0] || "")
     .toLowerCase()
     .trim();
+
+  const action = {
+    n: "next",
+    pre: "prev",
+  }[rawAction] || rawAction;
 
   try {
     const page = await initSpotify();
@@ -630,7 +678,9 @@ module.exports = {
     "play",
     "pause",
     "next",
+    "n",
     "prev",
+    "pre",
     "previous",
     "spotatus",
   ],
